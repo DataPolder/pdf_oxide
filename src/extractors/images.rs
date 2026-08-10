@@ -743,14 +743,25 @@ pub fn extract_image_from_xobject(
         return Err(Error::Image(format!("XObject subtype is not Image: {}", subtype)));
     }
 
-    let width = dict
-        .get("Width")
-        .and_then(|obj| obj.as_integer())
+    // ISO 32000-1 7.3.10: any dictionary value may be an indirect reference
+    // unless the entry restricts it, and /Width and /Height do not. Read the
+    // literal first, then dereference — without this a perfectly legal
+    // `/Width 2 0 R` is reported as a *missing* width and the image is
+    // dropped, leaving the page blank. `/Length` on the same dictionaries is
+    // already resolved, which is why such files yield stream data but no
+    // geometry.
+    let dimension = |key: &str| -> Option<i64> {
+        let obj = dict.get(key)?;
+        if let Some(value) = obj.as_integer() {
+            return Some(value);
+        }
+        doc?.resolve_object(obj).ok()?.as_integer()
+    };
+
+    let width = dimension("Width")
         .ok_or_else(|| Error::Image("Image missing /Width".to_string()))? as u32;
 
-    let height = dict
-        .get("Height")
-        .and_then(|obj| obj.as_integer())
+    let height = dimension("Height")
         .ok_or_else(|| Error::Image("Image missing /Height".to_string()))? as u32;
 
     let bits_per_component = dict
