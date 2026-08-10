@@ -424,7 +424,13 @@ pub fn extract_ccitt_params_with_width(
     };
 
     // Extract CCITT parameters with PDF defaults
-    let k = dict.get("K").and_then(|obj| obj.as_integer()).unwrap_or(-1); // Default: Group 4
+    // ISO 32000-1 Table 11: /K defaults to 0 — Group 3, 1-D. The historical
+    // Group 4 default sent every fax scan that omits /K to the wrong decoder,
+    // so the image was dropped and the page rasterised white while the render
+    // call reported success. The /ImageMask boundary in the page renderer
+    // already overrides this default locally; applying it here lets that
+    // override go away and fixes the plain Image XObject path too.
+    let k = dict.get("K").and_then(|obj| obj.as_integer()).unwrap_or(0);
 
     let columns = dict
         .get("Columns")
