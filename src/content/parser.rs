@@ -1244,6 +1244,48 @@ fn find_matching_et(data: &[u8], start: usize) -> Option<usize> {
 /// Same logic as `parse_content_stream_text_only` but avoids allocating a `Vec<Operator>`.
 /// Each operator is passed to `handler` as soon as it's parsed, improving cache locality
 /// and eliminating the intermediate operator vector (which can be 16MB+ for graphics-heavy pages).
+/// Parse one pre-scanned text region, closing any marked-content scope the
+/// region opened but did not close.
+///
+/// A region is a slice cut out of the middle of the content stream, so a `BDC`
+/// inside it is routinely matched by an `EMC` that falls beyond the slice and
+/// is therefore never parsed. Left unbalanced, that scope stays open for every
+/// later region on the page.
+///
+/// When the tag is `/PlacedPDF` that silences the rest of the page:
+/// `TextExtractor::is_content_suppressed` discards all text while
+/// `inside_placed_pdf` is set, so an InDesign page whose placed figure wraps a
+/// full-page drawing extracts nothing at all (measured: 0 spans instead of 96
+/// on an A4 manual page).
+///
+/// The regions are independent slices; the caller already brackets each one in
+/// `SaveState`/`RestoreState` for exactly this reason. Marked content needs the
+/// same treatment. Only scopes opened *within* the region are closed here, so
+/// this cannot end a scope the region did not start.
+fn parse_region_balanced<F>(region: &[u8], handler: &mut F) -> Result<()>
+where
+    F: FnMut(Operator) -> Result<()>,
+{
+    let mut depth: i32 = 0;
+    {
+        let mut counting = |op: Operator| {
+            match op {
+                Operator::BeginMarkedContent { .. } | Operator::BeginMarkedContentDict { .. } => {
+                    depth += 1
+                },
+                Operator::EndMarkedContent => depth -= 1,
+                _ => {},
+            }
+            handler(op)
+        };
+        parse_region_text_only(region, &mut counting)?;
+    }
+    for _ in 0..depth.max(0) {
+        handler(Operator::EndMarkedContent)?;
+    }
+    Ok(())
+}
+
 pub fn parse_and_execute_text_only<F>(data: &[u8], mut handler: F) -> Result<()>
 where
     F: FnMut(Operator) -> Result<()>,
@@ -1256,7 +1298,7 @@ where
                 PrescanResult::Empty => return Ok(()),
                 PrescanResult::Regions(regions) => {
                     for (start, end) in &regions {
-                        parse_region_text_only(&data[*start..*end], &mut handler)?;
+                        parse_region_balanced(&data[*start..*end], &mut handler)?;
                     }
                     return Ok(());
                 },
@@ -1281,7 +1323,7 @@ where
                                 size: font_size,
                             })?;
                         }
-                        parse_region_text_only(&data[*start..*end], &mut handler)?;
+                        parse_region_balanced(&data[*start..*end], &mut handler)?;
                         handler(Operator::RestoreState)?;
                     }
                     return Ok(());
@@ -6547,5 +6589,61 @@ mod tests {
             .iter()
             .any(|op| matches!(op, Operator::EndMarkedContent));
         assert!(has_emc, "EndMarkedContent (EMC) must be preserved in tagged PDF output");
+    }
+
+    /// An InDesign placed figure wraps its label AND its artwork in one
+    /// `/PlacedPDF` scope, so the matching `EMC` sits far past the end of the
+    /// pre-scanned text region. Without balancing, the scope stays open and
+    /// `TextExtractor` suppresses every later text run on the page.
+    #[test]
+    fn prescan_region_closes_marked_content_it_opened() {
+        let mut cs = Vec::new();
+        cs.extend_from_slice(b"/PlacedPDF /MC0 BDC\n");
+        cs.extend_from_slice(b"BT\n/F1 8 Tf\n1 0 0 1 60 780 Tm\n(figure label)Tj\nET\n");
+        for i in 0..7000u32 {
+            let line =
+                format!("q 1 0 0 1 {}.0 {}.0 cm 0.5 w 0 0 m 4 4 l S Q\n", i % 500, (i * 3) % 400);
+            cs.extend_from_slice(line.as_bytes());
+        }
+        cs.extend_from_slice(b"EMC\n");
+        cs.extend_from_slice(b"BT\n/F1 12 Tf\n1 0 0 1 60 700 Tm\n(body text)Tj\nET\n");
+        assert!(cs.len() > 256 * 1024, "stream must exceed 256KB prescan threshold");
+
+        let mut ops = Vec::new();
+        parse_and_execute_text_only(&cs, |op| {
+            ops.push(op);
+            Ok(())
+        })
+        .unwrap();
+
+        let opened = ops
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    Operator::BeginMarkedContent { .. } | Operator::BeginMarkedContentDict { .. }
+                )
+            })
+            .count();
+        let closed = ops
+            .iter()
+            .filter(|op| matches!(op, Operator::EndMarkedContent))
+            .count();
+        assert_eq!(
+            opened, closed,
+            "every marked-content scope a region opens must be closed before the next region"
+        );
+
+        let shown: Vec<&str> = ops
+            .iter()
+            .filter_map(|op| match op {
+                Operator::Tj { text } => std::str::from_utf8(text).ok(),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            shown.iter().any(|t| t.contains("body text")),
+            "text drawn after the EMC must still be parsed, got {shown:?}"
+        );
     }
 }
