@@ -951,7 +951,7 @@ mod tests {
     fn test_extract_ccitt_params_defaults() {
         let dict = Object::Dictionary(HashMap::new());
         let result = extract_ccitt_params(Some(&dict)).unwrap();
-        assert_eq!(result.k, -1); // Default: Group 4
+        assert_eq!(result.k, 0); // ISO 32000-1 Table 11: absent /K defaults to Group 3 1-D
         assert_eq!(result.columns, 1);
         assert!(result.rows.is_none());
         assert!(!result.black_is_1);
