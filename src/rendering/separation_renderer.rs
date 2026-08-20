@@ -1632,7 +1632,11 @@ fn execute_separation_operators(
                 current_path.close();
             },
 
-            Operator::Stroke => {
+            Operator::Stroke | Operator::CloseStroke => {
+                // ISO 32000-1 §8.5.3.2: `s` is `h S`.
+                if matches!(op, Operator::CloseStroke) {
+                    current_path.close();
+                }
                 apply_separation_clip(
                     &mut pending_clip,
                     &mut clip_stack,

@@ -1583,7 +1583,7 @@ impl PageRenderer {
                 },
 
                 // Path painting — suppressed when inside an excluded OCG layer
-                Operator::Stroke => {
+                Operator::Stroke | Operator::CloseStroke => {
                     if excluded_layer_depth == 0 {
                         apply_pending_clip(
                             &mut pending_clip,
@@ -1593,6 +1593,11 @@ impl PageRenderer {
                             &gs_stack,
                         );
                         let clip = clip_stack.last().and_then(|c| c.as_ref());
+                        // ISO 32000-1 §8.5.3.2 Table 60: `s` closes the current
+                        // subpath before stroking it — it is `h S`.
+                        if matches!(op, Operator::CloseStroke) {
+                            current_path.close();
+                        }
                         if let Some(path) = current_path.finish() {
                             let gs_clone = gs_stack.current().clone();
                             // Stroke side mirrors the path-fill routing —
@@ -1840,10 +1845,10 @@ impl PageRenderer {
                         let clip = clip_stack.last().and_then(|c| c.as_ref());
                         // ISO 32000-1 §8.5.3.1 Table 60: `b` and `b*` close
                         // the path before fill+stroke. The parser does not
-                        // decompose them (unlike `s`, which is emitted as
-                        // `ClosePath` + `Stroke`), so the dispatcher must
-                        // perform the close itself or the final segment of
-                        // an open subpath will not be painted by the stroke.
+                        // decompose them, so the dispatcher must perform the
+                        // close itself or the final segment of an open subpath
+                        // will not be painted by the stroke. `s` is handled the
+                        // same way in the `Stroke | CloseStroke` arm above.
                         if matches!(
                             op,
                             Operator::CloseFillStroke | Operator::CloseFillStrokeEvenOdd
@@ -9179,6 +9184,7 @@ fn is_paint_operator(op: &Operator) -> bool {
         Operator::Fill
             | Operator::FillEvenOdd
             | Operator::Stroke
+            | Operator::CloseStroke
             | Operator::FillStroke
             | Operator::FillStrokeEvenOdd
             | Operator::CloseFillStroke
@@ -10993,6 +10999,87 @@ mod tests {
              in a {}x{} image",
             img.width,
             img.height
+        );
+    }
+
+    /// Build a single-page 100x100 PDF whose whole content stream is `content`.
+    fn pdf_with_path_content(content: &[u8]) -> PdfDocument {
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets: Vec<usize> = Vec::new();
+        let mut append = |pdf: &mut Vec<u8>, number: usize, body: &[u8]| {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            pdf.extend_from_slice(body);
+            pdf.extend_from_slice(b"\nendobj\n");
+        };
+        append(&mut pdf, 1, b"<< /Type /Catalog /Pages 2 0 R >>");
+        append(&mut pdf, 2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        append(
+            &mut pdf,
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+              /Resources << /ProcSet [/PDF] >> /Contents 4 0 R >>",
+        );
+        let mut stream = format!("<< /Length {} >>\nstream\n", content.len()).into_bytes();
+        stream.extend_from_slice(content);
+        stream.extend_from_slice(b"\nendstream");
+        append(&mut pdf, 4, &stream);
+
+        let xref = pdf.len();
+        let object_count = offsets.len() + 1;
+        pdf.extend_from_slice(format!("xref\n0 {object_count}\n0000000000 65535 f \n").as_bytes());
+        for offset in &offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size {object_count} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n")
+                .as_bytes(),
+        );
+        PdfDocument::from_bytes(pdf).expect("open the synthetic PDF")
+    }
+
+    /// Render a path-only page; returns the PNG, its inked pixel count and its
+    /// total pixel count.
+    fn render_path_content(content: &[u8]) -> (Vec<u8>, usize, usize) {
+        let doc = pdf_with_path_content(content);
+        let options = crate::rendering::RenderOptions::with_dpi(72);
+        let image = crate::rendering::render_page(&doc, 0, &options).expect("render the page");
+        let decoded = image::load_from_memory_with_format(&image.data, image::ImageFormat::Png)
+            .expect("decode the rendered page")
+            .into_luma8();
+        let inked = decoded.pixels().filter(|p| p.0[0] < 250).count();
+        let total = (decoded.width() * decoded.height()) as usize;
+        (image.data.clone(), inked, total)
+    }
+
+    /// ISO 32000-1 §8.5.3.2: `s` is `h S` — it closes the subpath, strokes it,
+    /// and, being a painting operator, ends the path.
+    ///
+    /// It used to parse to `Operator::Other`, which the dispatcher ignores.
+    /// That cost two things at once: the stroke was never painted, and the path
+    /// was never cleared, so the next fill painted the abandoned geometry. A
+    /// stroked frame followed by a small fill inside it therefore came out as a
+    /// solid block.
+    #[test]
+    fn close_stroke_paints_its_path_and_does_not_leak_it_into_the_next_fill() {
+        const FRAME: &str = "0.96 w 10 10 m 90 10 l 90 90 l 10 90 l 10 10 l ";
+        const FILL: &str = "\n20 20 m 30 20 l 25 30 l 20 20 l f*";
+
+        let (with_s, s_ink, page_pixels) =
+            render_path_content(format!("{FRAME}s{FILL}").as_bytes());
+        let (with_h_s, h_s_ink, _) = render_path_content(format!("{FRAME}h S{FILL}").as_bytes());
+
+        assert!(s_ink > 0, "the fixture painted nothing, so it proves nothing about `s`");
+        assert_eq!(
+            with_s, with_h_s,
+            "`s` rendered {s_ink} inked pixels where the equivalent `h S` rendered {h_s_ink}"
+        );
+
+        // Guard the specific failure mode: the frame encloses 80x80 of a
+        // 100x100 page, so a leak fills well over half of it.
+        assert!(
+            s_ink * 2 < page_pixels,
+            "{s_ink} of {page_pixels} pixels inked — the frame leaked into the fill"
         );
     }
 }

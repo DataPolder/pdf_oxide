@@ -254,7 +254,7 @@ fn extract_graphics_paths(
             Operator::SetDash { array, phase: _ } => {
                 dash_pattern = array;
             },
-            Operator::Stroke | Operator::CloseFillStroke => {
+            Operator::Stroke | Operator::CloseStroke | Operator::CloseFillStroke => {
                 in_path = false;
             },
             Operator::EndPath => {
